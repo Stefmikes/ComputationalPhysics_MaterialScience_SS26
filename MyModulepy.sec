@@ -1,0 +1,5 @@
+# An example of a function in an external file
+
+def my_print_function(something):
+    print(something)
+
