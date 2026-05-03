@@ -18,15 +18,11 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import os
 
-# ────────────────────────────────────────────────────────────
 # Physical Constants
-# ────────────────────────────────────────────────────────────
 G_EARTH = 9.80665   # m/s² (standard gravitational acceleration)
 G_MARS  = 3.72076   # m/s²
 
-# ────────────────────────────────────────────────────────────
 # Default Simulation Parameters
-# ────────────────────────────────────────────────────────────
 DEFAULT_V0    = 50.0    # m/s  – initial speed
 DEFAULT_THETA = 45.0    # deg  – launch angle
 DEFAULT_M     = 1.0     # kg   – projectile mass
@@ -34,9 +30,7 @@ DEFAULT_DT    = 0.01    # s    – integration timestep
 DEFAULT_B     = 0.5     # kg/s – linear drag coefficient
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYTICAL SOLUTIONS — No Air Resistance
-# ════════════════════════════════════════════════════════════
 
 def analytical_trajectory_no_drag(t, v0, theta_deg, g):
     """Return (x, y, vx, vy) arrays for the drag-free analytical solution."""
@@ -60,10 +54,7 @@ def analytical_max_height_no_drag(v0, theta_deg, g):
     return (v0 * np.sin(np.radians(theta_deg)))**2 / (2 * g)
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYTICAL SOLUTIONS — Linear Drag  (F_drag = −b·v)
-# ════════════════════════════════════════════════════════════
-
 def analytical_trajectory_linear_drag(t, v0, theta_deg, g, m, b):
     """
     Closed-form solution with linear drag F = −b·v  (γ = b/m).
@@ -110,10 +101,7 @@ def analytical_time_of_flight_linear_drag(v0, theta_deg, g, m, b,
     return 0.5 * (lo + hi)
 
 
-# ════════════════════════════════════════════════════════════
 #  ACCELERATION FUNCTIONS  (pluggable force models)
-# ════════════════════════════════════════════════════════════
-
 def acceleration_no_drag(state, g, m, **kw):
     """a = [0, −g]  (vacuum projectile)."""
     return np.array([0.0, -g])
@@ -124,10 +112,7 @@ def acceleration_linear_drag(state, g, m, b=0.1, **kw):
     return np.array([-gamma * state[2], -gamma * state[3] - g])
 
 
-# ════════════════════════════════════════════════════════════
 #  NUMERICAL INTEGRATORS
-# ════════════════════════════════════════════════════════════
-
 def _ground_interpolation(traj, times, i):
     """Linearly interpolate to find the exact ground-strike point."""
     y_prev, y_curr = traj[i - 1, 1], traj[i, 1]
@@ -230,10 +215,7 @@ def simulate_verlet(accel_func, v0, theta_deg, g, m, dt,
     return traj, times
 
 
-# ════════════════════════════════════════════════════════════
 #  ENERGY HELPERS
-# ════════════════════════════════════════════════════════════
-
 def compute_energy(traj, m, g):
     """Return (KE, PE, Total) arrays from a trajectory."""
     KE = 0.5 * m * (traj[:, 2]**2 + traj[:, 3]**2)
@@ -252,10 +234,7 @@ def numerical_time_of_flight(times, traj):
     return times[-1]
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYSIS 1 — Trajectory & Energy Comparison
-# ════════════════════════════════════════════════════════════
-
 def analysis_1_trajectory(v0=DEFAULT_V0, theta=DEFAULT_THETA,
                           g=G_EARTH, m=DEFAULT_M, dt=DEFAULT_DT,
                           save_dir="figures"):
@@ -337,10 +316,7 @@ def analysis_1_trajectory(v0=DEFAULT_V0, theta=DEFAULT_THETA,
     plt.show()
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYSIS 2 — Timestep Convergence
-# ════════════════════════════════════════════════════════════
-
 def analysis_2_timestep(v0=DEFAULT_V0, theta=DEFAULT_THETA,
                         g=G_EARTH, m=DEFAULT_M, save_dir="figures"):
     os.makedirs(save_dir, exist_ok=True)
@@ -421,10 +397,7 @@ def analysis_2_timestep(v0=DEFAULT_V0, theta=DEFAULT_THETA,
     plt.show()
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYSIS 3 — Energy Deep-Dive
-# ════════════════════════════════════════════════════════════
-
 def analysis_3_energy(v0=DEFAULT_V0, theta=DEFAULT_THETA,
                       g=G_EARTH, m=DEFAULT_M, dt=DEFAULT_DT,
                       save_dir="figures"):
@@ -501,10 +474,7 @@ def analysis_3_energy(v0=DEFAULT_V0, theta=DEFAULT_THETA,
     plt.show()
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYSIS 4 — Air Resistance
-# ════════════════════════════════════════════════════════════
-
 def analysis_4_air_resistance(v0=DEFAULT_V0, theta=DEFAULT_THETA,
                                g=G_EARTH, m=DEFAULT_M, dt=DEFAULT_DT,
                                b_values=None, save_dir="figures"):
@@ -647,10 +617,7 @@ def analysis_4_air_resistance(v0=DEFAULT_V0, theta=DEFAULT_THETA,
 """)
 
 
-# ════════════════════════════════════════════════════════════
 #  ANALYSIS 5 — Earth vs Mars
-# ════════════════════════════════════════════════════════════
-
 def analysis_5_mars(v0=DEFAULT_V0, theta=DEFAULT_THETA,
                     m=DEFAULT_M, dt=DEFAULT_DT, save_dir="figures"):
     os.makedirs(save_dir, exist_ok=True)
@@ -733,10 +700,7 @@ def analysis_5_mars(v0=DEFAULT_V0, theta=DEFAULT_THETA,
 """)
 
 
-# ════════════════════════════════════════════════════════════
 #  MAIN
-# ════════════════════════════════════════════════════════════
-
 def main():
     print("=" * 65)
     print("  PROJECTILE DYNAMICS: ANALYTICAL vs NUMERICAL INTEGRATION")
