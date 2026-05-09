@@ -15,7 +15,7 @@ molecules = {
 }
 
 # Active molecule — change this to switch between species
-De, Re, a, mu = molecules["HCl"]
+De, Re, a, mu = molecules["H2"]
 
 # Unit conversions
 eV_to_J   = 1.60218e-19
@@ -108,8 +108,14 @@ def write_ovito_xyz(filename, t_arr, R_arr):
     print(f"OVITO trajectory written to: {filename}")
 
 #  FREQUENCY ESTIMATION  (zero-crossing method)
-def estimate_frequency(t_arr, R_arr):
-    """Estimate oscillation frequency by counting half-periods via zero crossings of (R - Re)."""
+def estimate_frequency(t_arr, R_arr, omega_ref=None):
+    """
+    Estimate oscillation frequency by counting half-periods via zero crossings of (R - Re).
+    omega_ref : expected harmonic frequency (nat. units) used to reject half-periods that
+                deviate by more than a factor of 20 from the harmonic half-period.
+                If None, no plausibility filter is applied.
+    Returns (omega, T, crossings) or None if estimation fails.
+    """
     signal = R_arr - Re
     crossings = []
     for i in range(len(signal) - 1):
@@ -120,7 +126,20 @@ def estimate_frequency(t_arr, R_arr):
     if len(crossings) < 2:
         return None
     half_periods = np.diff(crossings)
+
+    # Plausibility filter: discard half-periods outside [T_ref/20, T_ref*10]
+    if omega_ref is not None and omega_ref > 0:
+        T_ref_half = np.pi / omega_ref          # expected half-period
+        mask = (half_periods > T_ref_half / 20) & (half_periods < T_ref_half * 10)
+        half_periods = half_periods[mask]
+
+    if len(half_periods) == 0:
+        return None
+
     T = 2 * np.mean(half_periods)
+    if T <= 0:
+        return None
+
     omega = 2 * np.pi / T
     return omega, T, crossings
 
@@ -156,7 +175,7 @@ if __name__ == "__main__":
     # ── 1. Velocity-Verlet run ─────────────────
     t, R, Vv, Ek, Ep, Etot = run_simulation(delta, dt, n_steps, method="vv")
 
-    res = estimate_frequency(t, R)
+    res = estimate_frequency(t, R, omega_ref=omega_analytic)
     if res:
         omega_sim, T_sim, _ = res
         omega_sim_THz = omega_sim / time_unit_fs * 1e3
@@ -270,25 +289,39 @@ if __name__ == "__main__":
     print("Saved: output/morse_vs_harmonic_phase_space.png")
 
     # PLOT 4: ω(δ) — frequency vs initial displacement
+    # FIX: added missing first-order perturbation curve
     deltas = np.linspace(0.02, 1.50, 40)
     omegas_sim  = []
-    omegas_kept = []
     deltas_kept = []
 
     for d in deltas:
+        # Skip unbound initial conditions (initial energy >= De means dissociation)
+        if V_morse(Re + d) >= De:
+            continue
+
         _, R_d, _, _, _, _ = run_simulation(d, dt, n_steps, method="vv")
-        res_d = estimate_frequency(t, R_d)
-        if res_d:
+        res_d = estimate_frequency(t, R_d, omega_ref=omega_analytic)
+        if res_d and res_d[0] > 0:
             omegas_sim.append(res_d[0])
             deltas_kept.append(d)
 
-    # Analytical harmonic ω (constant)
-    omega_harm = np.full_like(deltas, omega_analytic)
+    deltas_kept = np.array(deltas_kept)
+
+    # First-order perturbation correction: ω ≈ ω₀(1 - 3/2 * a * δ)
+    omega_pert = omega_analytic * (1 - 1.5 * a * deltas_kept)
+
+    # Dissociation threshold from harmonic energy estimate
+    delta_dissoc = np.sqrt(De / (0.5 * k_morse))
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(deltas_kept, omegas_sim, s=30, color="steelblue", label="Simulation ω(δ)")
+    ax.scatter(deltas_kept, omegas_sim, s=30, color="steelblue",
+               label="Simulation ω(δ)", zorder=3)
     ax.axhline(omega_analytic, color="tomato", ls="--", lw=1.5,
                label=f"Harmonic limit ω = {omega_analytic:.3f}")
+    ax.plot(deltas_kept, omega_pert, color="darkgreen", ls="-.", lw=1.5,
+            label=r"First-order correction $\omega_0(1-\frac{3}{2}a\delta)$")
+    ax.axvline(x=delta_dissoc, color="gray", ls=":", lw=1.2,
+               label=f"Dissociation threshold ≈ {delta_dissoc:.2f} Å")
     ax.axvline(x=0, color="gray", ls=":", lw=0.8)
     ax.set_xlabel("Initial displacement δ  [Å]")
     ax.set_ylabel("Angular frequency ω  [nat. units]")
@@ -298,6 +331,55 @@ if __name__ == "__main__":
     plt.savefig("output/frequency_vs_delta.png", dpi=150)
     plt.close()
     print("Saved: output/frequency_vs_delta.png")
+
+    # PLOT 5: Multi-molecule scaling — ω₀ across species
+    # Shows the scaling law ω₀ = a*sqrt(2*De/μ) for different diatomic molecules
+    print("\nMulti-molecule scaling:")
+    mol_names  = []
+    omega_vals = []
+    omega_analytical_vals = []
+
+    colors_mol = ["steelblue", "tomato", "darkgreen", "darkorange"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for (name, (De_m, Re_m, a_m, mu_m)), col in zip(molecules.items(), colors_mol):
+        # Temporarily override globals for V_morse/F_morse via closures
+        De_save, Re_save, a_save, mu_save = De, Re, a, mu
+
+        # Patch module-level variables for this molecule
+        import sys
+        mod = sys.modules[__name__]
+        mod.De, mod.Re, mod.a, mod.mu = De_m, Re_m, a_m, mu_m
+
+        omega_0 = a_m * np.sqrt(2 * De_m / mu_m)
+        omega_0_THz = omega_0 / time_unit_fs * 1e3
+
+        _, R_m, _, _, _, _ = run_simulation(0.05, dt, n_steps, method="vv", mass=mu_m)
+        res_m = estimate_frequency(t, R_m, omega_ref=omega_0)
+
+        if res_m:
+            omega_s = res_m[0]
+            omega_s_THz = omega_s / time_unit_fs * 1e3
+            print(f"  {name:4s}: ω₀(analytic) = {omega_0:.3f} | ω(sim) = {omega_s:.3f} nat. units")
+            ax.bar(name, omega_0_THz, color=col, alpha=0.7, label=f"{name} analytical")
+            ax.scatter(name, omega_s_THz, color=col, s=80, zorder=5, marker="D",
+                       label=f"{name} simulated")
+
+        # Restore H2 globals
+        mod.De, mod.Re, mod.a, mod.mu = De_save, Re_save, a_save, mu_save
+
+    ax.set_xlabel("Molecule")
+    ax.set_ylabel("Harmonic frequency ω₀  [rad THz]")
+    ax.set_title(r"Scaling of $\omega_0 = a\sqrt{2D_e/\mu}$ across Diatomic Molecules")
+    # Custom legend: one entry per molecule
+    handles = [plt.Rectangle((0,0),1,1, color=c, alpha=0.7) for c in colors_mol]
+    labels  = list(molecules.keys())
+    ax.legend(handles, labels, title="Molecule")
+    plt.tight_layout()
+    plt.savefig("output/molecule_scaling.png", dpi=150)
+    plt.close()
+    print("Saved: output/molecule_scaling.png")
 
     print("\n✓ All done! Check the 'output/' folder for plots and trajectory.")
     print(f"  → Load 'output/trajectory.xyz' in OVITO to visualize the dimer motion.")
