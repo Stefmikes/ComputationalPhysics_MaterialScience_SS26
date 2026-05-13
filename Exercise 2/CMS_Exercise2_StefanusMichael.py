@@ -186,7 +186,7 @@ if __name__ == "__main__":
     stride = 10
     write_ovito_xyz("output/trajectory.xyz", t[::stride], R[::stride])
 
-    # PLOT 1: Energy conservation + R(t)
+    # PLOT 1: Energy conservation + R(t) — full view
     t_fs = t * time_unit_fs   # convert time axis to fs
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
@@ -215,6 +215,38 @@ if __name__ == "__main__":
     plt.savefig("output/energy_conservation.png", dpi=150)
     plt.close()
     print("Saved: output/energy_conservation.png")
+
+    # PLOT 1b: Zoomed-in version — first 200 fs to clearly show oscillations
+    # H2 period ≈ 7.8 fs, so 200 fs shows ~25 clean cycles
+    zoom_fs = 200
+    mask_zoom = t_fs <= zoom_fs
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+    fig.suptitle(f"H₂ Dimer – Morse Potential (Velocity-Verlet, first {zoom_fs} fs)", fontsize=13)
+
+    axes[0].plot(t_fs[mask_zoom], R[mask_zoom], color="steelblue", lw=1)
+    axes[0].axhline(Re, color="gray", ls="--", lw=0.8, label=f"$R_e$ = {Re} Å")
+    axes[0].set_ylabel("R  [Å]")
+    axes[0].legend()
+    axes[0].set_title("Internuclear Distance R(t)  [zoomed]")
+
+    axes[1].plot(t_fs[mask_zoom], Ek[mask_zoom],   label="Kinetic T",  color="tomato",    lw=1)
+    axes[1].plot(t_fs[mask_zoom], Ep[mask_zoom],   label="Potential V", color="royalblue", lw=1)
+    axes[1].plot(t_fs[mask_zoom], Etot[mask_zoom], label="Total E",    color="black",     lw=1.2, ls="--")
+    axes[1].set_ylabel("Energy  [eV]")
+    axes[1].legend()
+    axes[1].set_title("Energy Conservation  [zoomed]")
+
+    drift = (Etot - Etot[0]) / np.abs(Etot[0])
+    axes[2].plot(t_fs[mask_zoom], drift[mask_zoom] * 100, color="darkgreen", lw=1)
+    axes[2].set_ylabel("Rel. drift  [%]")
+    axes[2].set_xlabel("Time  [fs]")
+    axes[2].set_title("Relative Total Energy Drift  [zoomed]")
+
+    plt.tight_layout()
+    plt.savefig("output/energy_conservation_zoom.png", dpi=150)
+    plt.close()
+    print("Saved: output/energy_conservation_zoom.png")
 
     # PLOT 2: Euler vs Velocity-Verlet (energy drift)
     t_e, R_e, Vv_e, Ek_e, Ep_e, Etot_e = run_simulation(delta, dt, n_steps, method="euler")
