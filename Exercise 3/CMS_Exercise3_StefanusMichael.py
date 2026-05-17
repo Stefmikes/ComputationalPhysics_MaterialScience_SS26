@@ -161,7 +161,7 @@ if __name__ == "__main__":
     })
 
     # ── Potential parameters (in a.u.) ───────────────────────────────────
-    Vb    = 0.15    # barrier height  [Eh]
+    Vb    = 0.01    # barrier height  [Eh]
     d     = 2.0     # well minima at ±d  [a0]
     sigma = 0.5     # Gaussian width  [a0]
     x0    = -d      # initial packet centre (left well)
@@ -584,45 +584,124 @@ if __name__ == "__main__":
     fig.tight_layout()
     save(fig, "10_parameter_exploration_potentials")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # ANIMATION (first 600 fs of H sub-barrier)
+# ─────────────────────────────────────────────────────────────────────
+    # ANIMATION — adjustable barrier, correct W-shape, + classical overlay
     # ─────────────────────────────────────────────────────────────────────
     print("\n[Anim] Generating animation (0–100 fs) …")
 
-    mask_a = t_fs <= 100.0
-    pa     = psi_arr[mask_a][::max(1, mask_a.sum() // 300)]
-    ta     = t_fs[mask_a][::max(1, mask_a.sum() // 300)]
-    xa_    = xexp_H[mask_a][::max(1, mask_a.sum() // 300)]
+    # ── Choose regime: 'sub' tunneling only, 'above' classical crosses too ──
+    anim_regime = 'sub'   # change to 'above' to see classical crossing
 
-    Vpl = np.clip(V / Vb * 0.25, 0, 0.55)
-    fig_a, ax_a = plt.subplots(figsize=(7, 4))
+    if anim_regime == 'sub':
+        # Sub-barrier: k0=0, packet sits in left well, tunnels quantum-only
+        Vb_a   = 0.01           # Eh  → ≈ 0.27 eV  (low enough to see tunneling)
+        k0_a   = 0.0            # no momentum kick
+        label_regime = "sub-barrier (tunneling only)"
+    else:
+        # Above-barrier: kick gives enough KE to classically cross
+        Vb_a   = 0.15           # Eh  → ≈ 4.08 eV
+        k0_a   = np.sqrt(2 * m_H * 2 * Vb_a) / HBAR   # 2×Vb KE
+        label_regime = "above-barrier (classical + quantum cross)"
+
+    d_a    = 2.0                # well separation [a0]  — adjust freely
+    V_a    = double_well(x, Vb_a, d_a)
+
+    psi0_a = gaussian_wavepacket(x, x0, sigma)
+    if k0_a != 0:
+        psi0_a = psi0_a * np.exp(1j * k0_a * x)
+    psi0_a /= np.sqrt(np.sum(np.abs(psi0_a)**2) * dx)
+
+    # Quantum propagation
+    n_a      = int(100.0 / AU_T / dt_fine)
+    save_a   = max(1, n_a // 300)
+    times_a, psi_arr_a = run_quantum(x, V_a, psi0_a, dt_fine, n_a, m_H,
+                                      save_every=save_a)
+    t_fs_a  = times_a * AU_T
+    xexp_a  = expectation_x(psi_arr_a, x, dx) * AU_D
+
+    # Classical trajectory
+    v0_cl_a = HBAR * k0_a / m_H   # 0 if sub-barrier
+    x_cl_a  = run_classical(x0, v0_cl_a, dt_fine, n_a, m_H, Vb_a, d_a) * AU_D
+    t_cl_a  = np.arange(n_a + 1) * dt_fine * AU_T
+
+    # Subsample classical to match quantum frames
+    cl_idx  = np.round(np.linspace(0, n_a, len(t_fs_a))).astype(int)
+    xcl_s   = x_cl_a[cl_idx]
+
+    # ── Potential: proper W-shape scaled to fit axes ──────────────────────
+    # Scale so barrier peak sits at 0.45 (leaves room for probability density)
+    V_a_shifted = V_a - V_a.min()                        # min → 0
+    Vpl_a       = V_a_shifted / V_a_shifted.max() * 0.45 # barrier peak → 0.45
+
+    # Energy level line (scaled the same way)
+    Ep0_a   = np.sum(np.abs(psi0_a)**2 * V_a) * dx
+    Ek0_a   = HBAR**2 * k0_a**2 / (2 * m_H) + HBAR**2 / (8 * m_H * sigma**2)
+    E_a     = Ek0_a + Ep0_a
+    E_a_sc  = (E_a - V_a.min()) / V_a_shifted.max() * 0.45   # same scaling
+
+    # Well minima positions for vertical guides
+    xmin_L  = -d_a * AU_D
+    xmin_R  =  d_a * AU_D
+
+    # ── Build figure ──────────────────────────────────────────────────────
+    fig_a, ax_a = plt.subplots(figsize=(8, 4.5))
     apply_style(ax_a)
-    ax_a.plot(x*AU_D, Vpl, color="gray", lw=1, ls="--", alpha=0.7,
-              label="$V(x)$ (scaled)")
-    line,  = ax_a.plot(x*AU_D, np.zeros_like(x), color="#2c4f8c", lw=1.5)
-    xmark, = ax_a.plot([], [], "v", color="#e07b39", ms=8,
-                        label=r"$\langle x\rangle$")
-    ttext  = ax_a.text(0.02, 0.93, "", transform=ax_a.transAxes, fontsize=10)
-    ax_a.set_xlim(x[0]*AU_D, x[-1]*AU_D); ax_a.set_ylim(0, 0.65)
+
+    # Static elements
+    ax_a.plot(x * AU_D, Vpl_a, color="#555", lw=1.5, ls="--", alpha=0.8,
+              label=f"$V(x)$ scaled  ($V_b={Vb_a*AU_E:.2f}$ eV)")
+    ax_a.axhline(E_a_sc, color="#27ae60", lw=1.0, ls=":", alpha=0.8,
+                 label=rf"$\langle E\rangle = {E_a*AU_E:.3f}$ eV "
+                       f"({'< $V_b$' if E_a < Vb_a else '> $V_b$'})")
+    ax_a.axvline(xmin_L, color="#aaa", lw=0.8, ls=":", alpha=0.6)
+    ax_a.axvline(xmin_R, color="#aaa", lw=0.8, ls=":", alpha=0.6)
+    ax_a.axvline(0,      color="#aaa", lw=0.8, ls=":", alpha=0.4)   # barrier top
+
+    # Dynamic: probability density
+    line_q, = ax_a.plot(x * AU_D, np.zeros_like(x),
+                         color="#2c4f8c", lw=1.6, zorder=4)
+
+    # Dynamic: quantum <x> marker
+    xmark_q, = ax_a.plot([], [], "v", color="#e07b39", ms=9, zorder=5,
+                          label=r"Quantum $\langle x\rangle$")
+
+    # Dynamic: classical x(t) marker
+    xmark_c, = ax_a.plot([], [], "^", color="#c0392b", ms=9, zorder=5,
+                          label="Classical $x(t)$")
+
+    ttext = ax_a.text(0.02, 0.95, "", transform=ax_a.transAxes,
+                      fontsize=10, va="top")
+
+    ax_a.set_xlim(x[0] * AU_D, x[-1] * AU_D)
+    ax_a.set_ylim(0, 0.70)
     ax_a.set_xlabel("Position $x$ [Å]")
-    ax_a.set_ylabel(r"$|\psi(x,t)|^2$")
-    ax_a.set_title("Wave Packet Dynamics — H sub-barrier (0–100 fs)")
-    ax_a.legend(loc="upper right", fontsize=9)
+    ax_a.set_ylabel(r"$|\psi(x,t)|^2$  /  $V$ (scaled)")
+    ax_a.set_title(f"Wave Packet Dynamics — H  ({label_regime},  0–100 fs)")
+    ax_a.legend(loc="upper right", fontsize=8.5, ncol=2)
 
-    def update(fr):
-        prob = np.abs(pa[fr])**2
-        line.set_ydata(prob)
-        for c in ax_a.collections[1:]:
-            c.remove()
-        ax_a.fill_between(x*AU_D, prob, alpha=0.40, color="#2c4f8c")
-        xmark.set_data([xa_[fr]], [0.015])
-        ttext.set_text(f"$t$ = {ta[fr]:.1f} fs")
-        return line, xmark, ttext
+    # ── Animate ───────────────────────────────────────────────────────────
 
-    anim = FuncAnimation(fig_a, update, frames=len(ta), interval=40, blit=False)
-    anim.save("output/animation.gif", writer="pillow", fps=25, dpi=100)
+    def update_a(fr):
+        prob = np.abs(psi_arr_a[fr])**2
+
+        line_q.set_ydata(prob)
+
+        # Remove previous fill (keep only the static potential line collection)
+        while len(ax_a.collections) > 0:
+            ax_a.collections[0].remove()
+
+        ax_a.fill_between(x * AU_D, prob, alpha=0.38, color="#2c4f8c", zorder=3)
+
+        xmark_q.set_data([xexp_a[fr]], [0.018])
+        xmark_c.set_data([xcl_s[fr]],  [0.008])
+        ttext.set_text(f"$t$ = {t_fs_a[fr]:.1f} fs")
+        return line_q, xmark_q, xmark_c, ttext
+
+    anim_a = FuncAnimation(fig_a, update_a, frames=len(t_fs_a),
+                            interval=40, blit=False)
+    anim_a.save("output/animation.gif", writer="pillow", fps=25, dpi=110)
     plt.close(fig_a)
     print("  saved → output/animation.gif")
-
-    print("\n✓ All done!  Results in output/")
-    print("  Plots 01–10 (PNG) + animation.gif")
+    print(f"  Regime: {label_regime}")
+    print(f"  Vb = {Vb_a*AU_E:.3f} eV,  <E> = {E_a*AU_E:.3f} eV,  "
+          f"<E>/Vb = {E_a/Vb_a:.3f}")
