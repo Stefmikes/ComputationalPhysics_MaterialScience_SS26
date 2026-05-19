@@ -590,7 +590,7 @@ if __name__ == "__main__":
     print("\n[Anim] Generating animation (0–100 fs) …")
 
     # ── Choose regime: 'sub' tunneling only, 'above' classical crosses too ──
-    anim_regime = 'sub'   # change to 'above' to see classical crossing
+    anim_regime = 'above'   # change to 'above' to see classical crossing
 
     if anim_regime == 'sub':
         # Sub-barrier: k0=0, packet sits in left well, tunnels quantum-only
