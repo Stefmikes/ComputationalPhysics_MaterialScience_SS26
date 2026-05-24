@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"c:\\\\Users\\\\micha\\\\Desktop\\\\Uni Freiburg Pelajaran\\\\SS 2026\\\\Computational Physics Materials Science\\\\Exercise\")",
+      "Read(//c/Users/micha/Desktop/Uni Freiburg Pelajaran/SS 2026/Computational Physics Materials Science/Exercise/**)",
+      "Bash(python CMS_Exercise4_StefanusMichael.py)"
+    ]
+  }
+}
