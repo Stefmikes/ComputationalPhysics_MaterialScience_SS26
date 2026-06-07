@@ -235,8 +235,8 @@ if __name__ == "__main__":
         N_EQUIL, N_PROD = 800, 2000
         T_SWEEP = [100.0, 700.0, 5000.0]
     else:
-        N_EQUIL, N_PROD = 8000, 5000
-        T_SWEEP = [50.0, 100.0, 200.0, 400.0, 800.0, 1500.0, 3000.0, 5000.0]
+        N_EQUIL, N_PROD = 12000, 5000
+        T_SWEEP = [50.0, 100.0, 300.0, 1000.0, 2500.0, 5000.0]
 
     # warm up njit
     _ = _morse_forces_njit(build_cluster(N, L, 300.0).get_positions(),
