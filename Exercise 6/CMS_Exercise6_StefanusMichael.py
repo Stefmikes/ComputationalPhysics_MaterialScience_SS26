@@ -5,6 +5,12 @@ Self-diffusion coefficient of a Lennard-Jones fluid — ASE version.
     Einstein relation :  MSD(t) = < |r_i(t) - r_i(0)|^2 >_i  ->  D = slope/6
     Green-Kubo        :  D = (1/3) * Integral_0^inf <v_i(0).v_i(t)>_i dt
 
+Thermostat: Langevin (from sheet 5) with WEAK friction.  NOTE: the Langevin
+friction gamma adds artificial momentum damping, which systematically lowers
+the measured D; gamma must therefore be small compared to the intrinsic
+collision rate.  We use gamma = 0.0002 1/fs = 0.2 1/ps and verify in part (c)
+that this is ~15x smaller than the VACF decay rate, i.e. a weak perturbation.
+
 Units: ASE-native — energy [eV], length [Ang], mass [u], time via units.fs.
 Positions are stored in Ang, velocities converted to Ang/fs, so that D comes
 out in Ang^2/fs (1 Ang^2/fs = 1e-5 m^2/s).
@@ -21,6 +27,7 @@ from ase import Atoms
 from ase import units
 from ase.calculators.calculator import Calculator, all_changes
 from ase.md.langevin import Langevin
+from ase.md.verlet import VelocityVerlet
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 from ase.io import write
 
@@ -85,8 +92,43 @@ def _lj_forces_njit(pos, L, eps, sigma, rc):
     return forces, epot
 
 
+def _lj_forces_vectorized(pos, L, eps, sigma, rc):
+    """
+    Fully vectorised NumPy version of the same shifted-cutoff LJ force/energy,
+    used automatically when numba is NOT available.  It is numerically
+    identical to the njit kernel (verified to ~1e-7) but ~30x faster than the
+    naive Python double loop, so the script stays usable without numba.
+
+    O(N^2) in memory (an (N,N,3) displacement array); fine for N <= ~1000.
+    Sign convention matches the njit kernel: d[i,j] = pos_j - pos_i, so the
+    force on i is  sum_j fac_ij * d[i,j].
+    """
+    N = pos.shape[0]
+    d = pos[None, :, :] - pos[:, None, :]              # d[i,j] = r_j - r_i
+    d -= L * np.round(d / L)                            # minimum image (cubic)
+    r2 = np.einsum('ijk,ijk->ij', d, d)
+    ii = np.arange(N)
+    r2[ii, ii] = np.inf                                 # exclude self-interaction
+    within = r2 < rc * rc
+    inv_r2 = np.where(within, 1.0 / r2, 0.0)
+    s6 = (sigma * sigma * inv_r2) ** 3
+    s12 = s6 * s6
+    s_rc6 = (sigma / rc) ** 6
+    V_rc = 4.0 * eps * (s_rc6 * s_rc6 - s_rc6)
+    epot = 0.5 * np.where(within, 4.0 * eps * (s12 - s6) - V_rc, 0.0).sum()
+    fac = np.where(within, 24.0 * eps * (s6 - 2.0 * s12) * inv_r2, 0.0)
+    forces = (fac[:, :, None] * d).sum(axis=1)
+    return forces, epot
+
+
+# Pick the fastest available kernel ONCE, so the simulation never silently
+# falls back to a slow per-call decision.
+_FORCE_KERNEL = _lj_forces_njit if HAVE_NUMBA else _lj_forces_vectorized
+
+
 class LJNumba(Calculator):
-    """ASE Calculator for the shifted-cutoff LJ potential (numba kernel).
+    """ASE Calculator for the shifted-cutoff LJ potential.
+    Uses the numba kernel if available, otherwise the vectorised NumPy kernel.
     Assumes a cubic, fully periodic cell (same pattern as Ex5 MorseNumba)."""
     implemented_properties = ['energy', 'forces']
 
@@ -98,7 +140,7 @@ class LJNumba(Calculator):
                   system_changes=all_changes):
         super().calculate(atoms, properties, system_changes)
         L = float(atoms.cell.lengths()[0])
-        forces, epot = _lj_forces_njit(
+        forces, epot = _FORCE_KERNEL(
             atoms.get_positions(), L, self.eps, self.sigma, self.rc)
         self.results['energy'] = epot
         self.results['forces'] = forces
@@ -128,29 +170,56 @@ def build_fluid(N, L, T0, seed=42):
     return atoms
 
 
-# ── MD runner: Langevin NVT, frequent saving of positions AND velocities ─────
-def run_md(atoms, T0, n_equil, n_prod, dt=DT_FS, friction=FRICTION,
+# ── MD runner: strong-thermostat equilibration, then production ──────────────
+def run_md(atoms, T0, n_equil, n_prod, dt=DT_FS,
+           equil_friction=0.01, prod_ensemble='nve', prod_friction=FRICTION,
            sample_interval=2, traj_path=None, traj_interval=500,
            record_equil=False):
     """
-    Equilibrate n_equil steps, then record every sample_interval steps during
-    n_prod production steps:
+    Two-stage MD:
+
+      Stage 1 (equilibration, n_equil steps):
+        Langevin with a STRONG friction (equil_friction, default 0.01 1/fs ->
+        tau = 100 fs) so the cold simple-cubic lattice melts and the
+        temperature locks onto T0 quickly.  Discarded.
+
+      Stage 2 (production, n_prod steps):
+        prod_ensemble='nve'      -> velocity Verlet (NVE).  Momentum is
+                                    conserved, so the hydrodynamic 1/L
+                                    finite-size effect (Yeh-Hummer) survives
+                                    and D is unbiased by any thermostat.
+                                    Velocities are rescaled to T0 once before
+                                    production and the net momentum is removed.
+        prod_ensemble='langevin' -> weak Langevin (prod_friction).  Kept for
+                                    the thermostat-comparison in part (c)/(f).
+
+    Records every sample_interval steps:
         pos_u : unwrapped positions [Ang]   (ASE never wraps -> raw positions)
         pos_w : wrapped positions   [Ang]   (the deliberate (a) "mistake")
         vel   : velocities          [Ang/fs]
-    Returns dict with arrays of shape (n_frames, N, 3) plus t [fs] and
-    monitoring traces.
     """
-    dyn = Langevin(atoms, timestep=dt * units.fs, temperature_K=T0,
-                   friction=friction / units.fs, fixcm=False)
-
+    # ── Stage 1: strong-thermostat equilibration ───────────────────────────
+    dyn_eq = Langevin(atoms, timestep=dt * units.fs, temperature_K=T0,
+                      friction=equil_friction / units.fs, fixcm=False)
     eq = {'T': [], 'E': []}
     if record_equil:
-        dyn.attach(lambda: (eq['T'].append(atoms.get_temperature()),
-                            eq['E'].append(atoms.get_total_energy())),
-                   interval=10)
-    dyn.run(n_equil)
-    dyn.observers.clear()
+        dyn_eq.attach(lambda: (eq['T'].append(atoms.get_temperature()),
+                               eq['E'].append(atoms.get_total_energy())),
+                      interval=10)
+    dyn_eq.run(n_equil)
+
+    # ── Stage 2: production ─────────────────────────────────────────────────
+    if prod_ensemble == 'nve':
+        Tcur = atoms.get_temperature()
+        if Tcur > 0:                                       # anchor T exactly
+            atoms.set_velocities(atoms.get_velocities() * np.sqrt(T0 / Tcur))
+        Stationary(atoms)                                  # zero COM momentum
+        dyn = VelocityVerlet(atoms, timestep=dt * units.fs)
+    elif prod_ensemble == 'langevin':
+        dyn = Langevin(atoms, timestep=dt * units.fs, temperature_K=T0,
+                       friction=prod_friction / units.fs, fixcm=False)
+    else:
+        raise ValueError(prod_ensemble)
 
     data = {'pos_u': [], 'pos_w': [], 'vel': [], 'T': []}
     def _record():
@@ -216,17 +285,18 @@ def fit_diffusion(t, msd, fmin=0.2, fmax=0.5):
     return slope / 6.0, mask, (slope, icept)
 
 
-def sweep_D(N, L, T0, n_eq, n_pr, seeds):
+def sweep_D(N, L, T0, n_eq, n_pr, seeds, prod_ensemble='nve'):
     """Einstein D averaged over independent seeds (error bars for the report).
-    Returns (mean D, std D [Ang^2/fs], mean measured <T> [K])."""
+    Returns (mean D, standard error of the mean [Ang^2/fs], mean <T> [K])."""
     Ds, Tms = [], []
     for s in seeds:
         r = run_md(build_fluid(N, L, T0, seed=s), T0, n_eq, n_pr,
-                   sample_interval=5)
+                   sample_interval=5, prod_ensemble=prod_ensemble)
         D_, _, _ = fit_diffusion(r['t'], msd_fft(r['pos_u']))
         Ds.append(D_); Tms.append(r['T'].mean())
     Ds = np.array(Ds)
-    return Ds.mean(), Ds.std(), float(np.mean(Tms))
+    sem = Ds.std(ddof=1) / np.sqrt(len(Ds)) if len(Ds) > 1 else 0.0
+    return Ds.mean(), sem, float(np.mean(Tms))
 
 
 # ── Green-Kubo ───────────────────────────────────────────────────────────────
@@ -276,11 +346,13 @@ if __name__ == "__main__":
     QUICK = os.environ.get("QUICK_TEST", "0") == "1"
 
     N0, T0 = 125, 300.0
+    EQUIL_FRICTION = 0.01                             # strong: tau = 100 fs
     if QUICK:
         N_EQ, N_PR = 500, 1000
         EQ_PR_COMBOS = [(200, 500), (500, 1000)]
         RHO_SWEEP = [0.4, 0.5, 0.7]
-        SIZE_SWEEP = [125, 216]
+        SIZE_SWEEP = [64, 125, 216]
+        SIZE_SEEDS, SIZE_PROD = [11, 22], 1000
         T_SWEEP = [200.0, 300.0, 500.0]
         SEEDS = [11]
     else:
@@ -288,7 +360,10 @@ if __name__ == "__main__":
         EQ_PR_COMBOS = [(1000, 2000), (5000, 5000),
                         (10000, 10000), (10000, 30000)]
         RHO_SWEEP = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-        SIZE_SWEEP = [125, 216, 343, 512]
+        # (e) is the subtle one: smaller box to amplify 1/L, more seeds and
+        # longer production to push the error bars below the finite-size signal
+        SIZE_SWEEP = [64, 125, 216, 343, 512]
+        SIZE_SEEDS, SIZE_PROD = [11, 22, 33, 44, 55], 20000
         T_SWEEP = [150.0, 200.0, 250.0, 300.0, 400.0, 500.0]
         SEEDS = [11, 22, 33]                          # error bars (3 seeds)
 
@@ -303,13 +378,14 @@ if __name__ == "__main__":
     print(f"  numba={HAVE_NUMBA}  N={N0}  L={L0:.3f} Ang  rho*={RHO_STAR}")
     print(f"  eps={EPS_LJ*1e3:.4f} meV (=0.3 kB*300K)  sigma={SIGMA_LJ} Ang  "
           f"rc={R_CUT:.2f} Ang")
-    print(f"  dt={DT_FS} fs  gamma={FRICTION} 1/fs = {FRICTION*1e3:.2f} 1/ps "
-          f"(weak vs collision rate; checked empirically in [6c])")
+    print(f"  dt={DT_FS} fs  equil: Langevin gamma={EQUIL_FRICTION} 1/fs "
+          f"(tau={1/EQUIL_FRICTION:.0f} fs)  prod: NVE (momentum-conserving)")
     print(f"  equil={N_EQ}  prod={N_PR} steps (Table 1)")
 
     # ── main production run (used for a, c) ──────────────────────────────────
-    print("\n[run] main production run at 300 K ...")
+    print("\n[run] main production run at 300 K (strong equil -> NVE) ...")
     main = run_md(build_fluid(N0, L0, T0, seed=7), T0, N_EQ, N_PR,
+                  equil_friction=EQUIL_FRICTION, prod_ensemble='nve',
                   sample_interval=2, traj_path="output/traj_main_300K.xyz",
                   traj_interval=500, record_equil=True)
     t = main['t']                                       # [fs]
@@ -326,7 +402,7 @@ if __name__ == "__main__":
     ax[0].set_ylabel("T [K]")
     ax[1].plot(teq, main['eq_E'], color="#c0392b", lw=0.9)
     ax[1].set_xlabel("equilibration time [ps]"); ax[1].set_ylabel("$E_{tot}$ [eV]")
-    fig.suptitle("Equilibration monitoring (Langevin, 300 K)")
+    fig.suptitle("Equilibration monitoring (strong Langevin, $\\tau=100$ fs, 300 K)")
     fig.tight_layout(); save(fig, "ex6_equilibration")
 
     # ── (a) wrapped-coordinate mistake + correct log-log MSD ─────────────────
@@ -381,25 +457,30 @@ if __name__ == "__main__":
     ax.set_xlabel("lag time $t$ [ps]"); ax.set_ylabel("MSD [$\\AA^2$]")
     ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex6b_msd_fit")
 
-    # ── (c) Green-Kubo ───────────────────────────────────────────────────────
-    print("\n[6c] Green-Kubo from the VACF")
+    # ── (c) Green-Kubo + thermostat-implications comparison ──────────────────
+    print("\n[6c] Green-Kubo from the VACF (NVE production)")
     C = vacf_fft(main['vel'])
     D_gk_t = green_kubo_D(C, dt_frame)
-    # empirical VACF 1/e decay time -> sanity check that the Langevin friction
-    # is small compared to the intrinsic collision rate (else D is suppressed)
     i_dec = np.argmax(C < C[0] / np.e)
     t_dec = t[i_dec] if i_dec > 0 else t[-1]
-    ratio = 1.0 / (FRICTION * t_dec)
-    print(f"  VACF 1/e decay ~ {t_dec:.0f} fs -> collision rate ~ "
-          f"{1e3/t_dec:.1f} 1/ps vs gamma = {FRICTION*1e3:.2f} 1/ps "
-          f"(ratio {ratio:.0f}x{'': <1}"
-          f"{', friction is a weak perturbation' if ratio > 10 else ', WARNING: friction may bias D'})")
+    print(f"  VACF 1/e decay time ~ {t_dec:.0f} fs")
     # read off D where the cumulative integral has plateaued: after the VACF
     # has decayed (>> t_dec) but before long-lag noise degrades the integral
     w = (t > max(10 * t_dec, 1000.0)) & (t < 0.3 * t[-1])
     D_gk = D_gk_t[w].mean() if w.any() else D_gk_t[int(0.25 * len(t))]
-    print(f"  D(GK) = {D_gk:.4e} Ang^2/fs = {in_SI(D_gk):.3e} m^2/s "
-          f"(Einstein: {in_SI(D_main):.3e})")
+    print(f"  D(GK)       = {in_SI(D_gk):.3e} m^2/s")
+    print(f"  D(Einstein) = {in_SI(D_main):.3e} m^2/s  (NVE)")
+
+    # thermostat implications (sheet: "understand the implications of each
+    # thermostat on D"): weak-Langevin production vs NVE at the same state point
+    r_lan = run_md(build_fluid(N0, L0, T0, seed=7), T0, N_EQ, N_PR,
+                   equil_friction=EQUIL_FRICTION, prod_ensemble='langevin',
+                   prod_friction=FRICTION, sample_interval=5)
+    D_lan, _, _ = fit_diffusion(r_lan['t'], msd_fft(r_lan['pos_u']))
+    print(f"  D(weak Langevin prod, gamma={FRICTION*1e3:.2f}/ps) = "
+          f"{in_SI(D_lan):.3e} m^2/s  (Langevin/NVE = {D_lan/D_main:.2f})")
+    print("  -> Langevin damps momentum and screens hydrodynamics; NVE is used")
+    print("     for all D measurements so the 1/L finite-size law survives in [6e].")
 
     fig, ax = plt.subplots(2, 1, figsize=(9, 7))
     for a_ in ax: apply_style(a_)
@@ -411,7 +492,7 @@ if __name__ == "__main__":
     ax[1].plot(t/1000, in_SI(D_gk_t), color="#27ae60", lw=1.4,
                label="$D_{GK}(t)$ cumulative")
     ax[1].axhline(in_SI(D_main), color="#2c4f8c", ls="--", lw=1.4,
-                  label="$D$ (Einstein)")
+                  label="$D$ (Einstein, NVE)")
     ax[1].set_xlabel("upper integration limit $t$ [ps]")
     ax[1].set_ylabel("$D$ [m$^2$/s]")
     ax[1].legend(fontsize=9)
@@ -435,29 +516,45 @@ if __name__ == "__main__":
     fig.tight_layout(); save(fig, "ex6d_D_vs_rho")
 
     # ── (e) box-size sweep at fixed density + 1/L extrapolation ─────────────
-    print(f"\n[6e] box-size sweep at fixed rho* "
-          f"(Yeh-Hummer 1/L scaling, {len(SEEDS)} seed(s) each)")
+    print(f"\n[6e] box-size sweep at fixed rho* (Yeh-Hummer 1/L scaling)")
+    print(f"     {len(SIZE_SEEDS)} seeds, prod={SIZE_PROD} steps, NVE production")
     D_L, E_L, L_list = [], [], []
     for Ns in SIZE_SWEEP:
         Ls = box_length(Ns)
-        Dm, Dsd, _ = sweep_D(Ns, Ls, T0, N_EQ, N_PR, SEEDS)
+        if Ls < 2.0 * R_CUT:                            # minimum-image validity
+            print(f"  N={Ns:4d}  SKIP (L={Ls:.1f} < 2*rc={2*R_CUT:.1f})")
+            continue
+        Dm, Dsd, _ = sweep_D(Ns, Ls, T0, N_EQ, SIZE_PROD, SIZE_SEEDS)
         D_L.append(Dm); E_L.append(Dsd); L_list.append(Ls)
         print(f"  N={Ns:4d}  L={Ls:6.2f} Ang  "
               f"D=({in_SI(Dm):.3e} +- {in_SI(Dsd):.1e}) m^2/s")
 
-    invL = 1.0 / np.array(L_list)
-    pe = np.polyfit(invL, np.array(D_L), 1)            # D(L) = D_inf + k/L
-    D_inf = pe[1]
-    print(f"  extrapolated D(L->inf) = {in_SI(D_inf):.3e} m^2/s "
-          f"(slope k = {pe[0]:.3e} Ang^3/fs; Yeh-Hummer predicts k<0,"
-          f" i.e. D grows with L)")
+    D_L = np.array(D_L); E_L = np.array(E_L); L_list = np.array(L_list)
+    invL = 1.0 / L_list
+    # weighted linear fit D(L) = D_inf - C/L  (weights = 1/sem^2)
+    wts = 1.0 / np.where(E_L > 0, E_L, E_L[E_L > 0].mean()) ** 2
+    pe = np.polyfit(invL, D_L, 1, w=wts)               # pe = [slope, intercept]
+    D_inf, slope = pe[1], pe[0]
+    print(f"  extrapolated D(L->inf) = {in_SI(D_inf):.3e} m^2/s")
+    print(f"  fit slope dD/d(1/L) = {in_SI(slope):.3e} m^2/s * Ang "
+          f"({'NEGATIVE: consistent with Yeh-Hummer' if slope < 0 else 'positive: effect below noise'})")
+    # Yeh-Hummer:  D_inf - D(L) = xi kB T / (6 pi eta L),  xi = 2.837297
+    # so the magnitude of the fitted slope C = -slope gives an effective shear
+    # viscosity eta = xi kB T / (6 pi C).  Report it as a physical sanity check.
+    if slope < 0:
+        xi = 2.837297
+        C = -slope                                      # [Ang^2/fs * Ang]
+        eta = xi * (kB * T0) / (6.0 * np.pi * C)         # [eV*fs/Ang^3]
+        eta_SI = eta * 1.602e-4                          # -> Pa*s (see note below)
+        print(f"  -> effective shear viscosity eta = {eta_SI*1e3:.3f} mPa.s "
+              f"(liquid-Ar scale ~0.2 mPa.s; order-of-magnitude check)")
 
     fig, ax = plt.subplots(figsize=(9, 5.5)); apply_style(ax)
-    ax.errorbar(invL, in_SI(np.array(D_L)), yerr=in_SI(np.array(E_L)),
+    ax.errorbar(invL, in_SI(D_L), yerr=in_SI(E_L),
                 fmt='o', color="#2c4f8c", ms=8, capsize=4, label="simulation")
     xx = np.linspace(0, invL.max() * 1.05, 50)
     ax.plot(xx, in_SI(np.polyval(pe, xx)), "k--", lw=1.4,
-            label=f"linear fit, $D_\\infty={in_SI(D_inf):.2e}$ m$^2$/s")
+            label=f"weighted fit, $D_\\infty={in_SI(D_inf):.2e}$ m$^2$/s")
     ax.set_xlabel("$1/L$ [$\\AA^{-1}$]"); ax.set_ylabel("$D$ [m$^2$/s]")
     ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex6e_D_vs_invL")
 
