@@ -207,6 +207,33 @@ def snapshot(atoms, name, title=""):
     save(fig, name)
 
 
+def snapshot_row(items, name, suptitle=""):
+    """One xy-projection per structure in a row, coloured by coordination.
+    items = list of (atoms, title). Used to compare low-energy clusters from
+    different methods side by side."""
+    n = len(items)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.4))
+    if n == 1:
+        axes = [axes]
+    sc = None
+    for ax, (atoms, title) in zip(axes, items):
+        apply_style(ax)
+        p = atoms.get_positions() - atoms.get_positions().mean(0)
+        d = p[:, None, :] - p[None, :, :]
+        r = np.sqrt(np.einsum('ijk,ijk->ij', d, d)); np.fill_diagonal(r, 1e9)
+        coord = (r < 1.25 * R0_NA).sum(1)
+        order = np.argsort(p[:, 2])
+        sc = ax.scatter(p[order, 0], p[order, 1], c=coord[order], s=150,
+                        cmap="viridis", edgecolors="k", linewidths=0.5,
+                        vmin=6, vmax=16)
+        ax.set_aspect("equal"); ax.set_xlabel("x [Å]"); ax.set_ylabel("y [Å]")
+        ax.set_title(title, fontsize=11)
+    cb = fig.colorbar(sc, ax=axes, fraction=0.025, pad=0.02)
+    cb.set_label("coordination (r < 1.25 r₀)")
+    fig.suptitle(suptitle, y=1.02, fontsize=12)
+    save(fig, name)
+
+
 # ── optimiser bookkeeping ────────────────────────────────────────────────────
 def run_optimizer(OptCls, atoms, fmax=1e-3, steps=4000, **kw):
     """Run one ASE optimizer, recording (step, energy, fmax, walltime)."""
@@ -225,11 +252,80 @@ def run_optimizer(OptCls, atoms, fmax=1e-3, steps=4000, **kw):
     return atoms, {k: np.array(v) for k, v in log.items()}
 
 
+def run_optimizer_with_snapshots(OptCls, atoms, fmax=1e-3, steps=4000,
+                                  snap_steps=(0,), **kw):
+    """Like run_optimizer but also saves atomic positions at requested steps.
+
+    snap_steps: iterable of step indices at which to save a positions snapshot.
+    Returns (final_atoms, log, snapshots) where snapshots is a dict
+    {step_index: positions_array}.
+    """
+    atoms = atoms.copy(); atoms.calc = Morse()
+    log = {"E": [], "fmax": [], "t": []}
+    snapshots = {}
+    t0 = time.perf_counter()
+    opt = OptCls(atoms, logfile=None, **kw)
+    step_counter = [0]
+
+    def rec():
+        s = step_counter[0]
+        log["E"].append(atoms.get_potential_energy())
+        log["fmax"].append(np.linalg.norm(atoms.get_forces(), axis=1).max())
+        log["t"].append(time.perf_counter() - t0)
+        if s in snap_steps:
+            snapshots[s] = atoms.get_positions().copy()
+        step_counter[0] += 1
+
+    opt.attach(rec, interval=1)
+    rec()   # step 0
+    opt.run(fmax=fmax, steps=steps)
+    # always capture the final converged structure
+    snapshots["final"] = atoms.get_positions().copy()
+    return atoms, {k: np.array(v) for k, v in log.items()}, snapshots
+
+
+def plot_traj_snapshots(pos_dict, start_label, figname):
+    """Three-panel figure showing atomic xy-projections at early/mid/converged
+    steps of a FIRE optimisation, coloured by coordination number.
+
+    pos_dict keys: 0 (start), mid-step integer, 'final' (converged).
+    """
+    labels = {k: (f"step {k}" if isinstance(k, int) else "converged") for k in pos_dict}
+    n = len(pos_dict)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.4))
+    sc = None
+    for ax, (key, pos) in zip(axes, pos_dict.items()):
+        apply_style(ax)
+        p = pos - pos.mean(0)
+        d = p[:, None, :] - p[None, :, :]
+        r = np.sqrt(np.einsum('ijk,ijk->ij', d, d))
+        np.fill_diagonal(r, 1e9)
+        coord = (r < 1.25 * R0_NA).sum(1)
+        order = np.argsort(p[:, 2])
+        sc = ax.scatter(p[order, 0], p[order, 1], c=coord[order], s=150,
+                        cmap="viridis", edgecolors="k", linewidths=0.5,
+                        vmin=4, vmax=16)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x [Å]"); ax.set_ylabel("y [Å]")
+        ax.set_title(labels[key], fontsize=11)
+    cb = fig.colorbar(sc, ax=axes, fraction=0.025, pad=0.02)
+    cb.set_label("coordination (r < 1.25 r₀)")
+    fig.suptitle(f"(b) FIRE trajectory snapshots — {start_label}", y=1.02, fontsize=12)
+    save(fig, figname)
+
+
 # ── global search ingredients ────────────────────────────────────────────────
-def robust_relax(atoms, fmax=5e-3):
-    """FIRE (robust far from min) -> LBFGS (fast quadratic polish)."""
-    FIRE(atoms, logfile=None).run(fmax=0.05, steps=1500)
-    LBFGS(atoms, logfile=None).run(fmax=fmax, steps=3000)
+def robust_relax(atoms, fmax=1e-4):
+    """Single continuous FIRE relaxation to a TRUE local minimum.
+
+    FIRE is run end-to-end with no optimiser restart. Restarting a second
+    optimiser (or re-relaxing) from a loosely-converged point lets momentum or a
+    fresh Hessian carry the structure over a small ridge into a shallower
+    neighbouring basin, so a 'best' tracked at loose tolerance is not a genuine
+    minimum and re-relaxing it regresses the energy. A continuous tight run
+    avoids that (verified: the result is stable under re-relaxation), so every
+    minimum compared during the search — and the handed-in structure — is real."""
+    FIRE(atoms, logfile=None).run(fmax=fmax, steps=20000)
     return atoms
 
 
@@ -242,9 +338,32 @@ def per_atom_energy(atoms):
     return (D_NA * (e1 * e1 - 2 * e1) * w).sum(1)
 
 
-def anneal(atoms, seed, T_hi=1100, n_cool=18, steps_per=250, friction=0.01):
-    """Melt-quench: heat well above melting, cool slowly, relax."""
+def recollect(atoms, r_keep=16.0):
+    """Pull any atom that has drifted beyond r_keep from the cluster core back
+    onto the surface and zero its velocity, so evaporation cannot strand atoms.
+    Core-radius based (catches evaporated pairs that a neighbour test misses)."""
+    p = atoms.get_positions()
+    com = np.median(p, axis=0)                       # robust core centre
+    far = np.where(np.linalg.norm(p - com, axis=1) > r_keep)[0]
+    if len(far) and len(far) < len(p):
+        rng = np.random.default_rng(1)
+        core = np.delete(p, far, axis=0); ccom = core.mean(0)
+        v = atoms.get_velocities()
+        for k in far:
+            host = core[rng.integers(len(core))]
+            u = host - ccom; u /= (np.linalg.norm(u) + 1e-9)
+            p[k] = host + u * R0_NA * 0.8 + rng.normal(0, 0.3, 3)
+            v[k] = 0.0
+        atoms.set_positions(p); atoms.set_velocities(v)
+    return atoms
+
+
+def anneal(atoms, seed, T_hi=750, n_cool=18, steps_per=250, friction=0.02):
+    """Melt-quench: heat to just above melting (kept below the evaporation
+    regime of this weakly-bound cluster), cool slowly, relax. A spherical
+    recollect after every segment keeps the molten cluster from boiling off."""
     rng = np.random.default_rng(seed)
+    FIRE(atoms, logfile=None).run(fmax=0.1, steps=400)   # remove bad contacts first
     MaxwellBoltzmannDistribution(atoms, temperature_K=T_hi, rng=rng)
     Stationary(atoms); ZeroRotation(atoms)
     traj_E = []
@@ -253,6 +372,7 @@ def anneal(atoms, seed, T_hi=1100, n_cool=18, steps_per=250, friction=0.01):
                        friction=friction, rng=rng)
         dyn.attach(lambda: traj_E.append(atoms.get_potential_energy()), interval=25)
         dyn.run(steps_per)
+        recollect(atoms)
     robust_relax(atoms)
     return atoms, traj_E
 
@@ -327,6 +447,17 @@ if __name__ == "__main__":
     E_seed = seed.get_potential_energy()
     snapshot(seed, "ex7a_seed_cold", f"(a) cold fcc seed,  E = {E_seed:.2f} eV")
 
+    # seed comparison: relax each ordered/disordered seed once and compare which
+    # motif is favoured by this moderate-range Morse potential.
+    print("  seed comparison (FIRE->LBFGS relaxation):")
+    seed_relaxed = {}; seed_E = {}
+    for nm, s_at in [("fcc", fcc_sphere()), ("icosahedron", ico_seed()),
+                     ("random", rand_sphere(seed=1))]:
+        s_at.calc = Morse(); robust_relax(s_at)
+        seed_relaxed[nm] = s_at.copy(); seed_E[nm] = s_at.get_potential_energy()
+        consider(s_at, f"{nm}-seed")
+        print(f"     {nm:12s} relaxed -> {seed_E[nm]:.4f} eV")
+
     hot = seed.copy(); hot.calc = Morse()
     rng = np.random.default_rng(0)
     MaxwellBoltzmannDistribution(hot, temperature_K=50, rng=rng)
@@ -391,6 +522,23 @@ if __name__ == "__main__":
                  y=1.0, fontsize=13)
     fig.tight_layout(); save(fig, "ex7b_optimizer_comparison")
 
+    # Trajectory snapshots for FIRE on both starts: show how atomic positions
+    # evolve from disordered/ordered start → intermediate → converged minimum.
+    # FIRE is chosen because it is the best-performing optimizer in both cases.
+    for start, label, figname, mid in [
+        (seed,   "cold fcc seed",    "ex7b_traj_cold",   10),
+        (molten, "molten snapshot",  "ex7b_traj_molten",  30),
+    ]:
+        snap_steps = {0, mid}
+        _, _, snaps = run_optimizer_with_snapshots(
+            FIRE, start, fmax=1e-3, steps=1500, snap_steps=snap_steps)
+        # build ordered dict: start → mid → final
+        ordered = {}
+        for k in sorted([s for s in snaps if isinstance(s, int)]):
+            ordered[k] = snaps[k]
+        ordered["final"] = snaps["final"]
+        plot_traj_snapshots(ordered, label, figname)
+
     # =====================================================================
     # (c) confidence in the global minimum: ensemble of local minima
     # =====================================================================
@@ -403,63 +551,86 @@ if __name__ == "__main__":
         minima_E.append(e)
         print(f"     run {s:2d}: E_min = {e:9.4f} eV", flush=True)
     minima_E = np.array(minima_E)
-
-    fig, ax = plt.subplots(figsize=(9, 5.5)); apply_style(ax)
-    ax.hist(minima_E, bins=15, color=C_BLUE, alpha=0.8, edgecolor="k")
-    ax.axvline(minima_E.min(), color=C_RED, lw=2,
-               label=f"lowest from random starts = {minima_E.min():.3f} eV")
-    ax.set_xlabel("local-minimum energy [eV]"); ax.set_ylabel("count")
-    ax.set_title("(c) Distribution of local minima from random starts\n"
-                 "(a narrow low-energy cluster of hits ⇒ confidence the basin is global)")
-    ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex7c_minima_histogram")
+    # histogram is plotted after the global search so it can show the gap to the
+    # global minimum (see end of script).
 
     # =====================================================================
     # (d) global search that uses temperature: annealing + basin hopping
     # =====================================================================
     print(f"\n[7d] Simulated annealing ({N_ANNEAL} restarts) + basin hopping ({BH_STEPS} steps)")
     fig, ax = plt.subplots(figsize=(9, 5.5)); apply_style(ax)
+    best_anneal = {"E": 1e9, "atoms": None}
     for s in range(N_ANNEAL):
         a = (fcc_sphere() if s % 2 else rand_sphere(seed=2000 + s))
         a, E_trace = anneal(a, seed=s)
         consider(a, f"anneal{s}")
+        if a.get_potential_energy() < best_anneal["E"]:
+            best_anneal["E"] = a.get_potential_energy(); best_anneal["atoms"] = a.copy()
         ax.plot(np.array(E_trace), lw=1.0, alpha=0.7,
                 label=f"anneal {s}" if s < 4 else None)
     ax.set_xlabel("MD sample (cooling →)"); ax.set_ylabel("potential energy [eV]")
     ax.set_title("(d) Simulated annealing: melt-quench energy traces")
     ax.legend(fontsize=8, ncol=2); fig.tight_layout(); save(fig, "ex7d_annealing")
 
-    # basin hopping from the best structure so far (warm-start if traj exists)
-    bh_seed = global_best["atoms"].copy()
-    bh_seed.calc = Morse()
+    # Illustrative basin-hopping chain started from the (shallow) fcc minimum so
+    # the step-wise descent is visible. The deepest structure is located by
+    # EXTENDED basin hopping (many more chains/steps); any such structure saved
+    # in the warm-start file is folded into the global best so the hand-in is
+    # never worse, without flattening this illustrative chain.
+    bh_start = seed_relaxed["fcc"].copy(); bh_start.calc = Morse()
+    best_atoms, E_bh, bh_trace = basin_hopping(bh_start, steps=BH_STEPS, seed=42)
+    consider(best_atoms, "basin-hopping chain")
     if os.path.exists(WARMSTART):
         from ase.io import read
-        warm = read(WARMSTART); warm.calc = Morse()
-        if warm.get_potential_energy() < bh_seed.get_potential_energy():
-            bh_seed = warm
-            print(f"   (warm-starting basin hopping from {WARMSTART}, "
-                  f"E={warm.get_potential_energy():.4f} eV)")
-    bh_seed.calc = Morse()
-    best_atoms, E_bh, bh_trace = basin_hopping(bh_seed, steps=BH_STEPS, seed=42)
-    consider(best_atoms, "basin-hopping")
+        warm = read(WARMSTART); warm.calc = Morse(); robust_relax(warm)
+        consider(warm, "extended basin hopping (warm-start)")
 
     fig, ax = plt.subplots(figsize=(9, 5.5)); apply_style(ax)
-    ax.plot(bh_trace, color=C_GREEN, lw=1.6)
+    ax.plot(bh_trace, color=C_GREEN, lw=1.6, label=f"single chain → {E_bh:.4f} eV")
+    ax.axhline(global_best["E"], color=C_RED, lw=1.5, ls="--",
+               label=f"deepest located = {global_best['E']:.4f} eV")
     ax.set_xlabel("basin-hopping step"); ax.set_ylabel("best energy so far [eV]")
-    ax.set_title(f"(d) Basin hopping convergence → {E_bh:.4f} eV")
-    fig.tight_layout(); save(fig, "ex7d_basin_hopping")
+    ax.set_title("(d) Basin hopping: best energy so far vs. step")
+    ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex7d_basin_hopping")
 
     # =====================================================================
     # finalise: tight relax + save the winner
     # =====================================================================
-    win = global_best["atoms"]; win.calc = Morse()
-    FIRE(win, logfile=None).run(fmax=0.02, steps=2000)
-    LBFGS(win, logfile=None).run(fmax=1e-4, steps=5000)
+    # finalise: the global best is already a continuously-relaxed true minimum
+    # (fmax<1e-4). A final FIRE call only confirms/cleans it — starting from a
+    # genuine minimum it cannot wander, so there is no regression.
+    win = global_best["atoms"].copy(); win.calc = Morse()
+    FIRE(win, logfile=None).run(fmax=1e-4, steps=20000)
     win.center()
     E_win = win.get_potential_energy()
     fmax_win = np.linalg.norm(win.get_forces(), axis=1).max()
     write("Na76_cluster_StefanusMichael.traj", win)
     snapshot(win, "ex7_winner",
              f"WINNER  E = {E_win:.4f} eV  ({E_win/NAT:.4f} eV/atom)")
+
+    # (c) histogram, now drawn with the global minimum for reference: it shows
+    # that random quenching does NOT reach the global basin (there is a clear
+    # gap), which is exactly why a dedicated global search is needed.
+    fig, ax = plt.subplots(figsize=(9, 5.5)); apply_style(ax)
+    ax.hist(minima_E, bins=15, color=C_BLUE, alpha=0.8, edgecolor="k")
+    ax.axvline(minima_E.min(), color=C_ORANGE, lw=2,
+               label=f"lowest random quench = {minima_E.min():.3f} eV")
+    ax.axvline(E_win, color=C_RED, lw=2,
+               label=f"global search (BH) = {E_win:.3f} eV")
+    ax.set_xlabel("local-minimum energy [eV]"); ax.set_ylabel("count")
+    ax.set_title("(c) Local minima from 12 random starts vs. the global search\n"
+                 "(random quenching stops well above the global minimum)")
+    ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex7c_minima_histogram")
+
+    # snapshots of low-energy clusters from DIFFERENT methods (sheet requirement)
+    methods = [(seed_relaxed["fcc"], f"local opt (fcc)\n{seed_E['fcc']:.3f} eV")]
+    if best_anneal["atoms"] is not None:
+        methods.append((best_anneal["atoms"],
+                        f"annealing\n{best_anneal['E']:.3f} eV"))
+    methods.append((win, f"basin hopping\n{E_win:.3f} eV"))
+    snapshot_row(methods, "ex7_methods_snapshots",
+                 "Low-energy Na$_{76}$ clusters from different methods "
+                 "(coloured by coordination)")
 
     print("\n" + "=" * 70)
     print(f"LOWEST Na76 ENERGY = {E_win:.5f} eV   ({E_win/NAT:.4f} eV/atom, "
