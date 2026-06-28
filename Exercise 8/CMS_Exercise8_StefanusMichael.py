@@ -357,6 +357,15 @@ if __name__ == "__main__":
     fig.suptitle(f"Equilibration monitoring (Langevin NVT, 300 K, $\\rho^*$={RHO_START})")
     fig.tight_layout(); save(fig, "ex8_equilibration")
 
+    # block-error-vs-block-count scan (evidence the SEM has plateaued) --------
+    fig, ax = plt.subplots(figsize=(7, 4.2)); apply_style(ax)
+    ax.plot(scan[:, 0], scan[:, 1], 'o-', color="#2c4f8c", ms=4, lw=1.2)
+    ax.axhline(P_err, color="#c0392b", ls="--", lw=1.0,
+               label=f"quoted SEM at 20 blocks = {P_err:.2f} bar")
+    ax.set_xlabel("number of blocks $M$")
+    ax.set_ylabel("SEM [bar]")
+    ax.legend(fontsize=9); fig.tight_layout(); save(fig, "ex8b_block_error_scan")
+
     # -- (c) pressure vs density: measured vs eq.(3) prediction ---------------
     print(f"\n[8c] density sweep rho*=0.05..0.50  ({len(SEEDS)} seed(s) each)")
     rhos, P_meas, P_meas_err = [], [], []
